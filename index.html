@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QR Code Generator</title>
+<style>
+  :root {
+    --bg: #f4f4f7;
+    --card: #ffffff;
+    --accent: #6d4aff;
+    --accent-dark: #5636d9;
+    --text: #1a1a2e;
+    --muted: #6b6b80;
+    --border: #e2e2ea;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .app {
+    background: var(--card);
+    width: 100%;
+    max-width: 480px;
+    border-radius: 16px;
+    box-shadow: 0 10px 40px rgba(20, 20, 50, 0.08);
+    padding: 32px;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 24px; }
+  label { display: block; font-size: 0.85rem; font-weight: 600; margin: 16px 0 6px; }
+  textarea, select {
+    width: 100%;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-size: 0.95rem;
+    font-family: inherit;
+    background: #fafafc;
+    resize: vertical;
+  }
+  textarea:focus, select:focus { outline: 2px solid var(--accent); border-color: var(--accent); }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%;
+    margin-top: 20px;
+    padding: 14px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  button:hover { background: var(--accent-dark); }
+  button:disabled { background: #c5bdf0; cursor: not-allowed; }
+  #download {
+    background: #fff;
+    color: var(--accent);
+    border: 2px solid var(--accent);
+    display: none;
+  }
+  #download:hover { background: #f3efff; }
+  .output {
+    margin-top: 24px;
+    text-align: center;
+    display: none;
+  }
+  canvas {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-width: 100%;
+  }
+  .error { color: #d93025; font-size: 0.85rem; margin-top: 10px; display: none; }
+  .hint { color: var(--muted); font-size: 0.78rem; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>QR Code Generator</h1>
+  <p class="subtitle">Enter text, generate a QR code, and download it as a PNG.</p>
+
+  <label for="text">Text or URL</label>
+  <textarea id="text" rows="4" placeholder="Type your text here..."></textarea>
+  <div class="hint" id="capacityHint"></div>
+
+  <div class="row">
+    <div>
+      <label for="ecc">Error correction</label>
+      <select id="ecc">
+        <option value="L">Low (7%)</option>
+        <option value="M" selected>Medium (15%)</option>
+        <option value="Q">Quartile (25%)</option>
+        <option value="H">High (30%)</option>
+      </select>
+    </div>
+    <div>
+      <label for="scale">Pixel size per module</label>
+      <select id="scale">
+        <option value="4">Small</option>
+        <option value="8" selected>Medium</option>
+        <option value="12">Large</option>
+      </select>
+    </div>
+  </div>
+
+  <button id="generate">Generate QR Code</button>
+  <div class="error" id="error"></div>
+
+  <div class="output" id="output">
+    <canvas id="canvas"></canvas>
+    <button id="download">Download PNG</button>
+  </div>
+</div>
+
+<script>
+/* ---------- Minimal QR encoder (byte mode, versions 1-6, all ECC levels) ---------- */
+var GF_EXP = new Array(512), GF_LOG = new Array(256);
+(function () {
+  var x = 1;
+  for (var i = 0; i < 255; i++) { GF_EXP[i] = x; GF_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (var i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+function gmul(a, b) { return (a === 0 || b === 0) ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]]; }
+
+var RS_BLOCK_TABLE = [ /* [numBlocks, totalCodewords, dataCodewords] x (L,M,Q,H), v1..v6 */
+  [1,26,19],[1,26,16],[1,26,13],[1,26,9],
+  [1,44,34],[1,28,28],[1,44,22],[1,44,16],
+  [1,70,55],[1,44,44],[2,35,17],[2,35,13],
+  [1,100,80],[2,50,32],[2,50,24],[4,25,9],
+  [1,134,108],[2,67,43],[2,33,15],[2,34,11],
+  [2,86,68],[4,43,27],[4,43,19],[4,43,15]
+];
+var ALIGN_TABLE = [[],[6,18],[6,22],[6,26],[6,30],[6,34]];
+var ECC_BITS = { L: 1, M: 0, Q: 3, H: 2 };
+
+function BitBuffer() { this.buffer = []; this.length = 0; }
+BitBuffer.prototype.put = function (num, len) {
+  for (var i = 0; i < len; i++) this.putBit(((num >>> (len - i - 1)) & 1) === 1);
+};
+BitBuffer.prototype.putBit = function (bit) {
+  var idx = Math.floor(this.length / 8);
+  if (this.buffer.length <= idx) this.buffer.push(0);
+  if (bit) this.buffer[idx] |= (0x80 >>> (this.length % 8));
+  this.length++;
+};
+
+function rsGenPoly(ecCount) {
+  var poly = [1];
+  for (var i = 0; i < ecCount; i++) poly = polyMul(poly, [1, GF_EXP[i]]);
+  return poly;
+}
+function polyMul(a, b) {
+  var res = new Array(a.length + b.length - 1).fill(0);
+  for (var i = 0; i < a.length; i++)
+    for (var j = 0; j < b.length; j++)
+      res[i + j] ^= gmul(a[i], b[j]);
+  return res;
+}
+function polyMod(data, gen) {
+  var res = data.slice();
+  var gLead = gen.length - 1;
+  for (var i = 0; i < data.length - gLead; i++) {
+    var coef = res[i];
+    if (coef === 0) continue;
+    for (var j = 1; j < gen.length; j++) res[i + j] ^= gmul(gen[j], coef);
+  }
+  return res.slice(data.length - gLead);
+}
+
+function getMask(maskPattern, i, j) {
+  switch (maskPattern) {
+    case 0: return (i + j) % 2 === 0;
+    case 1: return i % 2 === 0;
+    case 2: return j % 3 === 0;
+    case 3: return (i + j) % 3 === 0;
+    case 4: return (Math.floor(i / 2) + Math.floor(j / 3)) % 2 === 0;
+    case 5: return ((i * j) % 2) + ((i * j) % 3) === 0;
+    case 6: return (((i * j) % 2) + ((i * j) % 3)) % 2 === 0;
+    case 7: return (((i * j) % 3) + ((i + j) % 2)) % 2 === 0;
+  }
+}
+
+function bchDigit(data) { var d = 0; while (data !== 0) { d++; data >>>= 1; } return d; }
+function bchTypeInfo(data) {
+  var G15 = 0b10100110111, d = data << 10;
+  while (bchDigit(d) - bchDigit(G15) >= 0) d ^= (G15 << (bchDigit(d) - bchDigit(G15)));
+  return ((data << 10) | d) ^ 0b101010000010010;
+}
+
+function buildQR(text, eccLevel) {
+  var bytes = new TextEncoder().encode(text);
+
+  // pick smallest version 1..6 that fits
+  var version = -1, chosen = null;
+  for (var v = 1; v <= 6; v++) {
+    var blk = RS_BLOCK_TABLE[(v - 1) * 4 + { L: 0, M: 1, Q: 2, H: 3 }[eccLevel]];
+    var dcTotal = blk[0] * blk[2];
+    var capBits = dcTotal * 8 - 4 - 8; // mode + char count
+    if (bytes.length * 8 <= capBits) { version = v; chosen = blk; break; }
+  }
+  if (version < 0) {
+    var maxCap = Math.floor((RS_BLOCK_TABLE[5 * 4 + { L: 0, M: 1, Q: 2, H: 3 }[eccLevel]][0] * RS_BLOCK_TABLE[5 * 4 + { L: 0, M: 1, Q: 2, H: 3 }[eccLevel]][2] * 8 - 12) / 8);
+    throw new Error('Text is too long. Max ~' + maxCap + ' characters at this error-correction level (fewer for non-ASCII text).');
+  }
+
+  var dataCountBits = 8;
+  var dcTotal = chosen[0] * chosen[2];
+
+  // build data bit stream
+  var buf = new BitBuffer();
+  buf.put(4, 4);            // byte mode
+  buf.put(bytes.length, dataCountBits);
+  for (var i = 0; i < bytes.length; i++) buf.put(bytes[i], 8);
+
+  // terminator + pad
+  var dataCapacityBits = dcTotal * 8;
+  buf.put(0, Math.min(4, dataCapacityBits - buf.length));
+  while (buf.length % 8 !== 0) buf.putBit(false);
+  var pad = [0xEC, 0x11], pi = 0;
+  while (buf.length < dataCapacityBits) buf.put(pad[pi++ % 2], 8);
+
+  // RS blocks
+  var numBlocks = chosen[0], ecPerBlock = chosen[1] - chosen[2];
+  var raw = buf.buffer;
+  var dcData = [], ecData = [];
+  var blockStart = 0;
+  for (var b = 0; b < numBlocks; b++) {
+    var block = raw.slice(blockStart, blockStart + chosen[2]);
+    blockStart += chosen[2];
+    dcData.push(block);
+    ecData.push(polyMod(block, rsGenPoly(ecPerBlock)));
+  }
+
+  // interleave
+  var data = [];
+  var maxDc = chosen[2], maxEc = ecPerBlock;
+  for (var i = 0; i < maxDc; i++)
+    for (var b = 0; b < numBlocks; b++) if (i < dcData[b].length) data.push(dcData[b][i]);
+  for (var i = 0; i < maxEc; i++)
+    for (var b = 0; b < numBlocks; b++) data.push(ecData[b][i]);
+
+  // build matrix, try all masks, keep lowest penalty
+  var best = null, bestScore = Infinity;
+  for (var m = 0; m < 8; m++) {
+    var map = makeMatrix(version, dcTotal, data, eccLevel, m, false);
+    var score = lostPoint(map, version);
+    if (score < bestScore) { bestScore = score; best = map; }
+  }
+  return best;
+}
+
+function makeMatrix(version, dcTotal, data, eccLevel, maskPattern, test) {
+  var size = version * 4 + 17;
+  var map = [];
+  for (var i = 0; i < size; i++) { map.push(new Array(size).fill(null)); }
+
+  // position probes
+  function probe(r, c) {
+    for (var i = -1; i <= 7; i++) {
+      for (var j = -1; j <= 7; j++) {
+        var rr = r + i, cc = c + j;
+        if (rr < 0 || cc < 0 || rr >= size || cc >= size) continue;
+        map[rr][cc] = (i >= 0 && i <= 6 && (j === 0 || j === 6)) ||
+                      (j >= 0 && j <= 6 && (i === 0 || i === 6)) ||
+                      (i >= 2 && i <= 4 && j >= 2 && j <= 4);
+      }
+    }
+  }
+  probe(0, 0); probe(size - 7, 0); probe(0, size - 7);
+
+  // alignment patterns
+  var pos = ALIGN_TABLE[version];
+  for (var i = 0; i < pos.length; i++)
+    for (var j = 0; j < pos.length; j++) {
+      var r = pos[i], c = pos[j];
+      if (map[r][c] !== null) continue;
+      for (var dr = -2; dr <= 2; dr++)
+        for (var dc = -2; dc <= 2; dc++)
+          map[r + dr][c + dc] = (dr === 0 || Math.abs(dr) === 2) && (dc === 0 || Math.abs(dc) === 2) ||
+                                (dr === 0 && dc === 0);
+    }
+
+  // timing patterns
+  for (var i = 8; i < size - 8; i++) {
+    if (map[i][6] === null) map[i][6] = i % 2 === 0;
+    if (map[6][i] === null) map[6][i] = i % 2 === 0;
+  }
+
+  // format info
+  var fi = bchTypeInfo((ECC_BITS[eccLevel] << 3) | maskPattern);
+  for (var i = 0; i < 15; i++) {
+    var mod = !test && ((fi >> i) & 1) === 1;
+    if (i < 6) map[i][8] = mod;
+    else if (i < 8) map[i + 1][8] = mod;
+    else map[size - 15 + i][8] = mod;
+    if (i < 8) map[8][size - i - 1] = mod;
+    else if (i < 9) map[8][15 - i] = mod;
+    else map[8][14 - i] = mod;
+  }
+  map[size - 8][8] = !test; // dark module
+
+  // place data with mask (zigzag)
+  var inc = -1, row = size - 1, bitIndex = 7, byteIndex = 0;
+  for (var col = size - 1; col > 0; col -= 2) {
+    if (col === 6) col--;
+    while (true) {
+      for (var c = 0; c < 2; c++) {
+        if (map[row][col - c] === null) {
+          var dark = false;
+          if (byteIndex < data.length) dark = ((data[byteIndex] >>> bitIndex) & 1) === 1;
+          if (getMask(maskPattern, row, col - c)) dark = !dark;
+          map[row][col - c] = dark;
+          bitIndex--;
+          if (bitIndex === -1) { byteIndex++; bitIndex = 7; }
+        }
+      }
+      row += inc;
+      if (row < 0 || size <= row) { row -= inc; inc = -inc; break; }
+    }
+  }
+  return map;
+}
+
+function lostPoint(map, version) {
+  var size = map.length, penalty = 0;
+
+  // Rule 1: runs of same color
+  for (var i = 0; i < size; i++) {
+    for (var dir = 0; dir < 2; dir++) {
+      var run = 1;
+      var prev = dir === 0 ? map[i][0] : map[0][i];
+      for (var j = 1; j < size; j++) {
+        var cur = dir === 0 ? map[i][j] : map[j][i];
+        if (cur === prev) {
+          run++;
+          if (run === 5) penalty += 3;
+          else if (run > 5) penalty += 1;
+        } else { run = 1; prev = cur; }
+      }
+    }
+  }
+  // Rule 2: 2x2 blocks
+  for (var r = 0; r < size - 1; r++)
+    for (var c = 0; c < size - 1; c++)
+      if (map[r][c] === map[r][c + 1] && map[r][c] === map[r + 1][c] && map[r][c] === map[r + 1][c + 1])
+        penalty += 3;
+
+  // Rule 3: finder-like patterns
+  var pat1 = [true, false, true, true, true, false, true, false, false, false, false];
+  var pat2 = [false, false, false, false, true, false, true, true, true, false, true];
+  function matchAt(getter, r, c, pat) {
+    for (var k = 0; k < 11; k++) {
+      var v = getter(r, c + k);
+      if (v === null || v !== pat[k]) return false;
+    }
+    return true;
+  }
+  for (var r = 0; r < size; r++)
+    for (var c = 0; c <= size - 11; c++) {
+      if (matchAt(function (r, c) { return map[r][c]; }, r, c, pat1) ||
+          matchAt(function (r, c) { return map[r][c]; }, r, c, pat2)) penalty += 40;
+      if (matchAt(function (r, c) { return map[c][r]; }, r, c, pat1) ||
+          matchAt(function (r, c) { return map[c][r]; }, r, c, pat2)) penalty += 40;
+    }
+
+  // Rule 4: dark ratio
+  var dark = 0;
+  for (var r = 0; r < size; r++)
+    for (var c = 0; c < size; c++) if (map[r][c]) dark++;
+  var total = size * size;
+  var ratio = Math.abs(100 * dark / total - 50) / 5;
+  penalty += Math.floor(ratio) * 10;
+
+  return penalty;
+}
+
+/* ---------- UI ---------- */
+var textEl = document.getElementById('text');
+var eccEl = document.getElementById('ecc');
+var scaleEl = document.getElementById('scale');
+var btn = document.getElementById('generate');
+var downloadBtn = document.getElementById('download');
+var outputEl = document.getElementById('output');
+var errorEl = document.getElementById('error');
+var canvas = document.getElementById('canvas');
+var hintEl = document.getElementById('capacityHint');
+
+function updateHint() {
+  var enc = new TextEncoder().encode(textEl.value).length;
+  hintEl.textContent = enc + ' bytes used · max ~106 characters for non-ASCII text, more for ASCII';
+}
+
+textEl.addEventListener('input', updateHint);
+updateHint();
+
+btn.addEventListener('click', function () {
+  errorEl.style.display = 'none';
+  var text = textEl.value;
+  if (!text) {
+    errorEl.textContent = 'Please enter some text first.';
+    errorEl.style.display = 'block';
+    return;
+  }
+  try {
+    var map = buildQR(text, eccEl.value);
+    render(map, parseInt(scaleEl.value, 10));
+    outputEl.style.display = 'block';
+    downloadBtn.style.display = 'block';
+  } catch (e) {
+    errorEl.textContent = e.message;
+    errorEl.style.display = 'block';
+    outputEl.style.display = 'none';
+  }
+});
+
+function render(map, scale) {
+  var size = map.length;
+  var quiet = 4; // quiet zone modules
+  var dim = (size + quiet * 2) * scale;
+  canvas.width = dim;
+  canvas.height = dim;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, dim, dim);
+  ctx.fillStyle = '#000000';
+  for (var r = 0; r < size; r++)
+    for (var c = 0; c < size; c++)
+      if (map[r][c])
+        ctx.fillRect((c + quiet) * scale, (r + quiet) * scale, scale, scale);
+}
+
+downloadBtn.addEventListener('click', function () {
+  var link = document.createElement('a');
+  link.download = 'qrcode.png';
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+});
+</script>
+</body>
+</html>
